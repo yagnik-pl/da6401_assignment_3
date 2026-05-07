@@ -1,17 +1,55 @@
-# DA6401 - Assignment 3: Implementing the Transformer for Machine Translation
+# DA6401 Assignment 3: Transformer NMT
 
-## Overview
+This folder implements the Transformer from "Attention Is All You Need" from
+scratch in PyTorch for German-to-English translation on Multi30k.
 
-In this assignment, you will implement the landmark architecture from the paper "Attention Is All You Need" from scratch using PyTorch. The goal is to develop a Neural Machine Translation (NMT) system capable of translating text from German to English using the Multi30k dataset.
+## Files
 
-## Project Structure
+- `model.py`: scaled dot-product attention, multi-head attention, masks,
+  sinusoidal/learned positional encodings, encoder, decoder, Transformer.
+- `lr_scheduler.py`: Noam learning-rate scheduler.
+- `dataset.py`: Multi30k loading, spaCy tokenization, vocabulary, dataloaders.
+- `train.py`: label smoothing, training, greedy decoding, BLEU, checkpoints,
+  W&B-compatible CSV logging.
 
-```text
-assignment3/
-├── requirements.txt
-├── README.md
-├── model.py           # Core Transformer architecture (Encoders, Decoders, Multi-Head Attention)
-├── utils.py           # Label Smoothing, Noam Scheduler, Masking Utilities
-├── dataset.py         # Multi30k dataset loading and spacy tokenization
-├── train.py           # Training loops and Greedy Decoding inference
+## Run
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
 ```
+
+Train the baseline:
+
+```bash
+python train.py --experiment single --epochs 10 --use-wandb
+```
+
+Run the full report ablation set:
+
+```bash
+python train.py --experiment all_report --epochs 10 --use-wandb
+```
+
+Use `--device cpu` only if CUDA is unavailable. The default model is compact
+enough for Multi30k while still implementing the required architecture.
+
+## CSV Outputs
+
+All report data is written under `outputs/csv/`.
+
+- `all_epoch_metrics.csv`: train loss, validation loss, validation accuracy,
+  learning rate, prediction confidence.
+- `all_step_metrics.csv`: per-step train loss, learning rate, accuracy, and
+  prediction confidence.
+- `scaling_ablation_grad_norms.csv`: first-1000-step Query/Key gradient norms.
+- `encoder_attention_heads.csv`: last encoder layer attention weights by head.
+- `all_bleu_scores.csv`: validation and test BLEU for each run.
+- `label_smoothing_prediction_confidence.csv`: confidence values for smoothing
+  comparison.
+- `report_index.csv`: run metadata and paths to run-specific CSV files.
+
+The model uses Pre-LayerNorm residual blocks with a final stack LayerNorm. This
+keeps training stable for the small-resource Multi30k experiments while still
+preserving the Transformer sublayer structure required in the assignment.
