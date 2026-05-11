@@ -11,6 +11,7 @@ scratch in PyTorch for German-to-English translation on Multi30k.
 - `dataset.py`: Multi30k loading, spaCy tokenization, vocabulary, dataloaders.
 - `train.py`: label smoothing, training, greedy decoding, BLEU, checkpoints,
   W&B-compatible CSV logging.
+- `vocabs.json`: vocabularies used by the saved checkpoint for inference.
 
 ## Run
 
@@ -35,9 +36,23 @@ python train.py --experiment all_report --epochs 10 --use-wandb
 Use `--device cpu` only if CUDA is unavailable. The default model is compact
 enough for Multi30k while still implementing the required architecture.
 
+## Inference
+
+```python
+from model import Transformer
+
+model = Transformer()
+model.eval()
+print(model.infer("Das ist ein Test."))
+```
+
+`Transformer()` loads `vocabs.json` and caches the best checkpoint under
+`checkpoints/`. If the checkpoint is missing, it downloads it from the configured
+Google Drive file/folder in `model.py`.
+
 ## CSV Outputs
 
-All report data is written under `outputs/csv/`.
+Report data is generated under `outputs/csv/` when training runs.
 
 - `all_epoch_metrics.csv`: train loss, validation loss, validation accuracy,
   learning rate, prediction confidence.

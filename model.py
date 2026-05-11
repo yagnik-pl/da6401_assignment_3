@@ -6,12 +6,18 @@ PyTorch building blocks. Masks use True for positions that must be hidden.
 """
 
 import copy
+import json
 import math
+from pathlib import Path
 from typing import Optional, Tuple
 
+import spacy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+MODULE_DIR = Path(__file__).resolve().parent
 
 
 def _attention_impl(
@@ -290,20 +296,114 @@ class Decoder(nn.Module):
 class Transformer(nn.Module):
     """Full encoder-decoder Transformer for German-to-English translation."""
 
+    DEFAULT_CHECKPOINT_FILENAME = "baseline_noam_scaled_sinusoidal_ls01_best.pt"
+    DEFAULT_CHECKPOINT_PATH = MODULE_DIR / "checkpoints" / DEFAULT_CHECKPOINT_FILENAME
+    DEFAULT_CHECKPOINT_ID = "1Y6UmF-_9Wc2-oVls1QFlZl-98diXiD5C"
+    DEFAULT_CHECKPOINT_FOLDER_URL = (
+        "https://drive.google.com/drive/folders/"
+        "1J4uz-pIFyqxxzDphWbB_FQa58TUtrzrb?usp=sharing"
+    )
+
     def __init__(
         self,
-        src_vocab_size: int,
-        tgt_vocab_size: int,
-        d_model: int = 512,
-        N: int = 6,
+        src_vocab_size: Optional[int] = None,
+        tgt_vocab_size: Optional[int] = None,
+        d_model: int = 256,
+        N: int = 3,
         num_heads: int = 8,
-        d_ff: int = 2048,
+        d_ff: int = 512,
         dropout: float = 0.1,
         max_len: int = 5000,
         positional_encoding: str = "sinusoidal",
         use_scaling: bool = True,
+        vocab_path: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+        checkpoint_id: Optional[str] = None,
+        checkpoint_folder_url: Optional[str] = None,
+        load_pretrained: Optional[bool] = None,
     ) -> None:
         super().__init__()
+
+        explicit_vocab_sizes = src_vocab_size is not None or tgt_vocab_size is not None
+        explicit_checkpoint = (
+            checkpoint_path is not None
+            or checkpoint_id is not None
+            or checkpoint_folder_url is not None
+        )
+        should_load_pretrained = (
+            load_pretrained
+            if load_pretrained is not None
+            else explicit_checkpoint or not explicit_vocab_sizes
+        )
+
+        checkpoint = None
+        if should_load_pretrained:
+            checkpoint_file = self._ensure_checkpoint(
+                checkpoint_path,
+                checkpoint_id,
+                checkpoint_folder_url,
+            )
+            checkpoint = self._load_torch_checkpoint(checkpoint_file)
+            checkpoint_config = self._checkpoint_config(checkpoint)
+            if checkpoint_config:
+                src_vocab_size = checkpoint_config.get("src_vocab_size", src_vocab_size)
+                tgt_vocab_size = checkpoint_config.get("tgt_vocab_size", tgt_vocab_size)
+                d_model = checkpoint_config.get("d_model", d_model)
+                N = checkpoint_config.get("N", N)
+                num_heads = checkpoint_config.get("num_heads", num_heads)
+                d_ff = checkpoint_config.get("d_ff", d_ff)
+                dropout = checkpoint_config.get("dropout", dropout)
+                max_len = checkpoint_config.get("max_len", max_len)
+                positional_encoding = checkpoint_config.get(
+                    "positional_encoding",
+                    positional_encoding,
+                )
+                use_scaling = checkpoint_config.get("use_scaling", use_scaling)
+            else:
+                inferred = self._infer_config_from_state_dict(
+                    self._checkpoint_state_dict(checkpoint)
+                )
+                src_vocab_size = src_vocab_size or inferred.get("src_vocab_size")
+                tgt_vocab_size = tgt_vocab_size or inferred.get("tgt_vocab_size")
+                d_model = inferred.get("d_model", d_model)
+                d_ff = inferred.get("d_ff", d_ff)
+                N = inferred.get("N", N)
+                max_len = inferred.get("max_len", max_len)
+                positional_encoding = inferred.get(
+                    "positional_encoding",
+                    positional_encoding,
+                )
+
+        self.src_tokenizer = None
+        self.tgt_tokenizer = None
+        self.src_vocab = None
+        self.tgt_vocab = None
+
+        if vocab_path is None and (not explicit_vocab_sizes or should_load_pretrained):
+            vocab_path = self._find_vocab_path()
+
+        if vocab_path and Path(vocab_path).exists():
+            self._load_vocabs(Path(vocab_path))
+        elif not explicit_vocab_sizes:
+            self.src_vocab = self._minimal_vocab()
+            self.tgt_vocab = self._minimal_vocab()
+
+        try:
+            self.src_tokenizer = spacy.blank("de").tokenizer
+            self.tgt_tokenizer = spacy.blank("en").tokenizer
+        except Exception:
+            pass
+
+        if self.src_vocab is not None and isinstance(self.src_vocab, dict) and not checkpoint:
+            src_vocab_size = len(self.src_vocab.get("itos", []))
+        if self.tgt_vocab is not None and isinstance(self.tgt_vocab, dict) and not checkpoint:
+            tgt_vocab_size = len(self.tgt_vocab.get("itos", []))
+
+        if src_vocab_size is None:
+            src_vocab_size = 10000
+        if tgt_vocab_size is None:
+            tgt_vocab_size = 10000
+
         self.src_vocab_size = src_vocab_size
         self.tgt_vocab_size = tgt_vocab_size
         self.d_model = d_model
@@ -333,6 +433,192 @@ class Transformer(nn.Module):
         self.generator = nn.Linear(d_model, tgt_vocab_size)
 
         self._reset_parameters()
+
+        if should_load_pretrained and checkpoint is not None:
+            self._load_checkpoint_state(checkpoint)
+
+    @staticmethod
+    def _minimal_vocab() -> dict:
+        tokens = ["<unk>", "<pad>", "<sos>", "<eos>"]
+        return {"stoi": {token: idx for idx, token in enumerate(tokens)}, "itos": tokens}
+
+    def _find_vocab_path(self) -> Optional[Path]:
+        """Search for vocabularies in common locations."""
+        candidates = [
+            MODULE_DIR / "vocabs.json",
+            MODULE_DIR / "outputs" / "vocabs.json",
+            Path.cwd() / "vocabs.json",
+            Path.cwd() / "outputs" / "vocabs.json",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def _load_vocabs(self, vocab_path: Path) -> None:
+        """Load vocabularies from a JSON file."""
+        try:
+            with vocab_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.src_vocab = data.get("src_vocab")
+            self.tgt_vocab = data.get("tgt_vocab")
+        except Exception as e:
+            print(f"Warning: Failed to load vocabs from {vocab_path}: {e}")
+
+    def _ensure_checkpoint(
+        self,
+        checkpoint_path: Optional[str],
+        checkpoint_id: Optional[str],
+        checkpoint_folder_url: Optional[str],
+    ) -> Path:
+        checkpoint_file = self._resolve_checkpoint_path(
+            checkpoint_path or str(self.DEFAULT_CHECKPOINT_PATH)
+        )
+        if checkpoint_file.exists():
+            return checkpoint_file
+
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_id = checkpoint_id or self.DEFAULT_CHECKPOINT_ID
+        checkpoint_folder_url = checkpoint_folder_url or self.DEFAULT_CHECKPOINT_FOLDER_URL
+        self._download_checkpoint(checkpoint_file, checkpoint_id, checkpoint_folder_url)
+        return checkpoint_file
+
+    @staticmethod
+    def _resolve_checkpoint_path(checkpoint_path: str) -> Path:
+        path = Path(checkpoint_path)
+        if path.is_absolute():
+            return path
+        module_path = MODULE_DIR / path
+        if module_path.exists() or not path.exists():
+            return module_path
+        return path.resolve()
+
+    def _download_checkpoint(
+        self,
+        checkpoint_file: Path,
+        checkpoint_id: Optional[str],
+        checkpoint_folder_url: Optional[str],
+    ) -> None:
+        try:
+            import gdown
+        except ImportError:
+            print("Warning: install gdown or place the checkpoint under checkpoints/.")
+            return
+
+        if checkpoint_id:
+            try:
+                gdown.download(
+                    id=checkpoint_id,
+                    output=str(checkpoint_file),
+                    quiet=False,
+                    fuzzy=True,
+                )
+                if checkpoint_file.exists():
+                    return
+            except Exception as e:
+                print(f"Warning: Failed to download checkpoint by ID: {e}")
+
+        if checkpoint_folder_url:
+            try:
+                files = gdown.download_folder(
+                    url=checkpoint_folder_url,
+                    output=str(checkpoint_file.parent),
+                    quiet=False,
+                    use_cookies=False,
+                    remaining_ok=True,
+                )
+                if checkpoint_file.exists() or not files:
+                    return
+                for downloaded in files:
+                    downloaded_path = Path(downloaded)
+                    if downloaded_path.suffix in {".pt", ".pth"}:
+                        downloaded_path.replace(checkpoint_file)
+                        return
+            except Exception as e:
+                print(f"Warning: Failed to download checkpoint folder: {e}")
+
+    @staticmethod
+    def _load_torch_checkpoint(checkpoint_file: Path):
+        if not checkpoint_file.exists():
+            print(f"Warning: Checkpoint not found at {checkpoint_file}")
+            return None
+        try:
+            return torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(checkpoint_file, map_location="cpu")
+        except Exception:
+            try:
+                return torch.load(checkpoint_file, map_location="cpu")
+            except Exception as e:
+                print(f"Warning: Failed to load checkpoint from {checkpoint_file}: {e}")
+                return None
+
+    @staticmethod
+    def _checkpoint_config(checkpoint) -> dict:
+        if isinstance(checkpoint, dict) and isinstance(checkpoint.get("model_config"), dict):
+            return checkpoint["model_config"]
+        return {}
+
+    @staticmethod
+    def _checkpoint_state_dict(checkpoint) -> Optional[dict]:
+        if checkpoint is None:
+            return None
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            return checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict):
+            return checkpoint
+        return None
+
+    @staticmethod
+    def _infer_config_from_state_dict(state_dict: Optional[dict]) -> dict:
+        if not state_dict:
+            return {}
+
+        config = {}
+        src_embed = state_dict.get("src_embed.weight")
+        tgt_embed = state_dict.get("tgt_embed.weight")
+        generator = state_dict.get("generator.weight")
+        ff_weight = state_dict.get("encoder.layers.0.feed_forward.linear1.weight")
+
+        if src_embed is not None:
+            config["src_vocab_size"], config["d_model"] = src_embed.shape
+        if tgt_embed is not None:
+            config["tgt_vocab_size"] = tgt_embed.shape[0]
+            config.setdefault("d_model", tgt_embed.shape[1])
+        if generator is not None:
+            config["tgt_vocab_size"] = generator.shape[0]
+        if ff_weight is not None:
+            config["d_ff"] = ff_weight.shape[0]
+
+        layer_ids = []
+        for key in state_dict:
+            parts = key.split(".")
+            if len(parts) > 3 and parts[:2] == ["encoder", "layers"]:
+                try:
+                    layer_ids.append(int(parts[2]))
+                except ValueError:
+                    pass
+        if layer_ids:
+            config["N"] = max(layer_ids) + 1
+
+        if "src_pos.embedding.weight" in state_dict:
+            config["positional_encoding"] = "learned"
+            config["max_len"] = state_dict["src_pos.embedding.weight"].shape[0]
+        elif "src_pos.pe" in state_dict:
+            config["positional_encoding"] = "sinusoidal"
+            config["max_len"] = state_dict["src_pos.pe"].shape[1]
+
+        return config
+
+    def _load_checkpoint_state(self, checkpoint) -> None:
+        state_dict = self._checkpoint_state_dict(checkpoint)
+        if state_dict is None:
+            return
+        try:
+            self.load_state_dict(state_dict)
+            print(f"Loaded model weights from {self.DEFAULT_CHECKPOINT_FILENAME}")
+        except Exception as e:
+            print(f"Warning: Failed to load checkpoint state: {e}")
 
     @property
     def model_config(self) -> dict:
@@ -378,3 +664,71 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         memory = self.encode(src, src_mask)
         return self.decode(memory, src_mask, tgt, tgt_mask)
+
+    def infer(
+        self,
+        german_sentence: str,
+        max_decode_len: int = 100,
+    ) -> str:
+        """Translate a German sentence with greedy decoding."""
+        self.eval()
+        device = next(self.parameters()).device
+
+        if self.src_tokenizer is None:
+            try:
+                self.src_tokenizer = spacy.blank("de").tokenizer
+            except Exception:
+                return ""
+
+        tokens = [token.text.lower() for token in self.src_tokenizer(german_sentence)]
+
+        if self.src_vocab is None or not isinstance(self.src_vocab, dict):
+            return ""
+
+        src_stoi = self.src_vocab.get("stoi", {})
+        unk_idx = src_stoi.get("<unk>", 0)
+        sos_idx = src_stoi.get("<sos>", 2)
+        eos_idx = src_stoi.get("<eos>", 3)
+        pad_idx = src_stoi.get("<pad>", 1)
+
+        src_ids = [sos_idx] + [src_stoi.get(token, unk_idx) for token in tokens] + [eos_idx]
+        src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)
+
+        src_mask = make_src_mask(src_tensor, pad_idx=pad_idx)
+
+        with torch.no_grad():
+            memory = self.encode(src_tensor, src_mask)
+
+        tgt_vocab = self.tgt_vocab
+        if tgt_vocab is None or not isinstance(tgt_vocab, dict):
+            return ""
+
+        tgt_stoi = tgt_vocab.get("stoi", {})
+        tgt_sos_idx = tgt_stoi.get("<sos>", 2)
+        tgt_eos_idx = tgt_stoi.get("<eos>", 3)
+        tgt_pad_idx = tgt_stoi.get("<pad>", 1)
+        tgt_itos = tgt_vocab.get("itos", [])
+
+        ys = torch.full((1, 1), tgt_sos_idx, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            for _ in range(max_decode_len - 1):
+                tgt_mask = make_tgt_mask(ys, pad_idx=tgt_pad_idx).to(device)
+                logits = self.decode(memory, src_mask, ys, tgt_mask)
+                next_word = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                ys = torch.cat([ys, next_word], dim=1)
+                if next_word.item() == tgt_eos_idx:
+                    break
+
+        output_ids = ys[0].tolist()
+        output_tokens = []
+        specials = {"<unk>", "<pad>", "<sos>", "<eos>"}
+
+        for idx in output_ids:
+            token = tgt_itos[idx] if idx < len(tgt_itos) else "<unk>"
+            if token == "<eos>":
+                break
+            if token not in specials:
+                output_tokens.append(token)
+
+        return " ".join(output_tokens)

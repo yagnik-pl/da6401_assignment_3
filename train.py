@@ -215,6 +215,23 @@ def load_checkpoint(
     return int(checkpoint["epoch"])
 
 
+def load_model_from_checkpoint(path: str, device: str = "cpu") -> Transformer:
+    """Load a Transformer model from checkpoint with saved configuration.
+
+    This function reconstructs the model using the model_config saved in the checkpoint,
+    ensuring all required arguments (src_vocab_size, tgt_vocab_size) are provided.
+    """
+    checkpoint = torch.load(path, map_location=device)
+    model_config = checkpoint.get("model_config")
+
+    if model_config is None:
+        raise ValueError(f"Checkpoint at {path} does not contain 'model_config'")
+
+    model = Transformer(**model_config).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model
+
+
 def run_training_experiment() -> None:
     """CLI entry point for one training run or all report ablations."""
     args = _parse_args()
