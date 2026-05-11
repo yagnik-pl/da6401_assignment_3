@@ -506,36 +506,89 @@ class Transformer(nn.Module):
             return
 
         if checkpoint_id:
-            try:
-                gdown.download(
-                    id=checkpoint_id,
-                    output=str(checkpoint_file),
-                    quiet=False,
-                    fuzzy=True,
-                )
-                if checkpoint_file.exists():
-                    return
-            except Exception as e:
-                print(f"Warning: Failed to download checkpoint by ID: {e}")
+            file_url = f"https://drive.google.com/uc?id={checkpoint_id}"
+            if self._try_gdown_downloads(
+                [
+                    lambda: gdown.download(
+                        id=checkpoint_id,
+                        output=str(checkpoint_file),
+                        quiet=False,
+                    ),
+                    lambda: gdown.download(
+                        url=file_url,
+                        output=str(checkpoint_file),
+                        quiet=False,
+                    ),
+                    lambda: gdown.download(file_url, str(checkpoint_file), quiet=False),
+                ],
+                checkpoint_file,
+                "checkpoint file",
+            ):
+                return
 
         if checkpoint_folder_url:
+            self._try_gdown_folder_downloads(
+                gdown,
+                checkpoint_folder_url,
+                checkpoint_file,
+            )
+
+    @staticmethod
+    def _try_gdown_downloads(downloaders: list, checkpoint_file: Path, label: str) -> bool:
+        last_error = None
+        for download in downloaders:
             try:
-                files = gdown.download_folder(
-                    url=checkpoint_folder_url,
-                    output=str(checkpoint_file.parent),
-                    quiet=False,
-                    use_cookies=False,
-                    remaining_ok=True,
-                )
-                if checkpoint_file.exists() or not files:
-                    return
-                for downloaded in files:
-                    downloaded_path = Path(downloaded)
-                    if downloaded_path.suffix in {".pt", ".pth"}:
-                        downloaded_path.replace(checkpoint_file)
-                        return
+                result = download()
             except Exception as e:
-                print(f"Warning: Failed to download checkpoint folder: {e}")
+                last_error = e
+                continue
+            if checkpoint_file.exists():
+                return True
+            if result:
+                downloaded_path = Path(result)
+                if downloaded_path.exists():
+                    downloaded_path.replace(checkpoint_file)
+                    return True
+        if last_error is not None:
+            print(f"Warning: Failed to download {label}: {last_error}")
+        return False
+
+    def _try_gdown_folder_downloads(
+        self,
+        gdown,
+        checkpoint_folder_url: str,
+        checkpoint_file: Path,
+    ) -> bool:
+        last_error = None
+        for download in (
+            lambda: gdown.download_folder(
+                url=checkpoint_folder_url,
+                output=str(checkpoint_file.parent),
+                quiet=False,
+            ),
+            lambda: gdown.download_folder(
+                checkpoint_folder_url,
+                str(checkpoint_file.parent),
+                quiet=False,
+            ),
+        ):
+            try:
+                files = download()
+            except Exception as e:
+                last_error = e
+                continue
+            if checkpoint_file.exists():
+                return True
+            if not files:
+                continue
+            for downloaded in files:
+                downloaded_path = Path(downloaded)
+                if downloaded_path.suffix in {".pt", ".pth"} and downloaded_path.exists():
+                    downloaded_path.replace(checkpoint_file)
+                    return True
+        if last_error is not None:
+            print(f"Warning: Failed to download checkpoint folder: {last_error}")
+        return False
 
     @staticmethod
     def _load_torch_checkpoint(checkpoint_file: Path):
